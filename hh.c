@@ -19,12 +19,6 @@
 // number of bytes in a JMP/CALL rel32 instruction
 #define REL32_SZ 5
 
-// text seen in /proc/<pid>/maps for text areas
-static const char *text_area = " r-xp ";
-
-// this should be a string that will uniquely identify libc in /proc/<pid>/maps
-static const char *libc_string = "/libc-2";
-
 // find the location of a shared library in memory
 void *find_library(pid_t pid, const char *libname) {
   char filename[32];
@@ -33,9 +27,11 @@ void *find_library(pid_t pid, const char *libname) {
   char *line = NULL;
   size_t line_size = 0;
 
+  // text seen in /proc/<pid>/maps for text areas
+
   while (getline(&line, &line_size, f) >= 0) {
     char *pos = strstr(line, libname);
-    if (pos != NULL && strstr(line, text_area)) {
+    if (pos != NULL && strstr(line, "-xp ")) {
       long val = strtol(line, NULL, 16);
       free(line);
       fclose(f);
@@ -46,6 +42,13 @@ void *find_library(pid_t pid, const char *libname) {
   fclose(f);
   return NULL;
 }
+
+void* __find_libc_symbol(pid_t pid, const char* libstr, void* fn, const char* fname) {
+  void *their_lib = find_library(pid, libstr);
+  void *our_lib = find_library(getpid(), libstr);
+  return their_lib + ((void *)fn - our_lib);
+}
+#define find_libc_symbol(pid, fn) __find_libc_symbol(pid, "/libc-2", fn, #fn)
 
 // Update the text area of pid at the area starting at where. The data copied
 // should be in the new_text buffer whose size is given by len. If old_text is
@@ -104,24 +107,6 @@ int singlestep(pid_t pid) {
   return do_wait("PTRACE_SINGLESTEP");
 }
 
-void check_yama(void) {
-  FILE *yama_file = fopen("/proc/sys/kernel/yama/ptrace_scope", "r");
-  if (yama_file == NULL) {
-    return;
-  }
-  char yama_buf[8];
-  memset(yama_buf, 0, sizeof(yama_buf));
-  fread(yama_buf, 1, sizeof(yama_buf), yama_file);
-  if (strcmp(yama_buf, "0\n") != 0) {
-    printf("\nThe likely cause of this failure is that your system has "
-           "kernel.yama.ptrace_scope = %s",
-           yama_buf);
-    printf("If you would like to disable Yama, you can run: "
-           "sudo sysctl kernel.yama.ptrace_scope=0\n");
-  }
-  fclose(yama_file);
-}
-
 int32_t compute_jmp(void *from, void *to) {
   int64_t delta = (int64_t)to - (int64_t)from - REL32_SZ;
   if (delta < INT_MIN || delta > INT_MAX) {
@@ -137,7 +122,6 @@ int setenv_process(pid_t pid, const char* env_key, const char* env_value) {
   // attach to the process
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
-    check_yama();
     return -1;
   }
 
@@ -226,29 +210,8 @@ int setenv_process(pid_t pid, const char* env_key, const char* env_value) {
     goto fail;
   }
 
-  // Calculate the position of the setenv routine in the other process'
-  // address
-  // space. This is a little bit tricky because of ASLR on Linux. What we do
-  // is
-  // we find the offset in memory that libc has been loaded in their process,
-  // and then we find the offset in memory that libc has been loaded in our
-  // process. Then we take the delta betwen our setenv and our libc start,
-  // and
-  // assume that the same delta will apply to the other process.
-  //
-  // For this mechanism to work, this program must be compiled with -fPIC to
-  // ensure that our setenv has an address relative to the one in libc.
-  //
-  // Additionally, this could fail if libc has been updated since the remote
-  // process has been restarted. This is a pretty unlikely situation, but if
-  // the
-  // remote process has been running for a long time and you update libc, the
-  // offset of the symbols could have changed slightly.
-  void *their_libc = find_library(pid, libc_string);
-  void *our_libc = find_library(getpid(), libc_string);
-  FILE *their_setenv = their_libc + ((void *)setenv - our_libc);
-  printf("their libc           %p\n", their_libc);
-  printf("their setenv         %p\n", their_setenv);
+  void *their_setenv = find_libc_symbol(pid, setenv);
+  printf("their setenv           %p\n", their_setenv);
 
   // We want to make a call like:
   //
@@ -390,7 +353,6 @@ int unsetenv_process(pid_t pid, const char* env_key) {
   // attach to the process
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
-    check_yama();
     return -1;
   }
 
@@ -479,10 +441,7 @@ int unsetenv_process(pid_t pid, const char* env_key) {
     goto fail;
   }
 
-  void *their_libc = find_library(pid, libc_string);
-  void *our_libc = find_library(getpid(), libc_string);
-  FILE *their_unsetenv = their_libc + ((void *)unsetenv - our_libc);
-  printf("their libc           %p\n", their_libc);
+  void *their_unsetenv = find_libc_symbol(pid, unsetenv);
   printf("their unsetenv         %p\n", their_unsetenv);
 
 
