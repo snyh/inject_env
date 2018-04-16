@@ -19,9 +19,6 @@
 // number of bytes in a JMP/CALL rel32 instruction
 #define REL32_SZ 5
 
-// copy in the string including the trailing null byte
-static const char *format = "instruction pointer = %p\n";
-
 // text seen in /proc/<pid>/maps for text areas
 static const char *text_area = " r-xp ";
 
@@ -135,7 +132,7 @@ int32_t compute_jmp(void *from, void *to) {
   return (int32_t)delta;
 }
 
-int fprintf_process(pid_t pid) {
+int setenv_process(pid_t pid, const char* env_key, const char* env_value) {
   // attach to the process
   if (ptrace(PTRACE_ATTACH, pid, NULL, NULL)) {
     perror("PTRACE_ATTACH");
@@ -165,6 +162,7 @@ int fprintf_process(pid_t pid) {
   // invoking
   // the mmap(2) system call and asking for a single page.
   struct user_regs_struct newregs;
+  printf("SIZEOF URS:%d\n", sizeof(newregs));
   memmove(&newregs, &oldregs, sizeof(newregs));
   newregs.rax = 9;                           // mmap
   newregs.rdi = 0;                           // addr
@@ -227,18 +225,18 @@ int fprintf_process(pid_t pid) {
     goto fail;
   }
 
-  // Calculate the position of the fprintf routine in the other process'
+  // Calculate the position of the setenv routine in the other process'
   // address
   // space. This is a little bit tricky because of ASLR on Linux. What we do
   // is
   // we find the offset in memory that libc has been loaded in their process,
   // and then we find the offset in memory that libc has been loaded in our
-  // process. Then we take the delta betwen our fprintf and our libc start,
+  // process. Then we take the delta betwen our setenv and our libc start,
   // and
   // assume that the same delta will apply to the other process.
   //
   // For this mechanism to work, this program must be compiled with -fPIC to
-  // ensure that our fprintf has an address relative to the one in libc.
+  // ensure that our setenv has an address relative to the one in libc.
   //
   // Additionally, this could fail if libc has been updated since the remote
   // process has been restarted. This is a pretty unlikely situation, but if
@@ -247,19 +245,17 @@ int fprintf_process(pid_t pid) {
   // offset of the symbols could have changed slightly.
   void *their_libc = find_library(pid, libc_string);
   void *our_libc = find_library(getpid(), libc_string);
-  void *their_fprintf = their_libc + ((void *)fprintf - our_libc);
-  FILE *their_stderr = their_libc + ((void *)stderr - our_libc);
+  FILE *their_setenv = their_libc + ((void *)setenv - our_libc);
   printf("their libc           %p\n", their_libc);
-  printf("their fprintf        %p\n", their_libc);
-  printf("their stderr         %p\n", their_stderr);
+  printf("their setenv         %p\n", their_setenv);
 
   // We want to make a call like:
   //
-  //   fprintf(stderr, "instruction pointer = %p\n", rip);
+  //   setenv(env_key, env_value);
   //
   // To do this we're going to do the following:
   //
-  //   * put a CALL instruction into the mmap area that calls fprintf
+  //   * put a CALL instruction into the mmap area that calls setenv
   //   * put a TRAP instruction right after the CALL
   //   * put the format string right after the TRAP
   //   * use the TRAP to restore the original text/program state
@@ -271,15 +267,17 @@ int fprintf_process(pid_t pid) {
   // insert a CALL instruction
   size_t offset = 0;
   new_text[offset++] = 0xe8; // CALL rel32
-  int32_t fprintf_delta = compute_jmp(mmap_memory, their_fprintf);
-  memmove(new_text + offset, &fprintf_delta, sizeof(fprintf_delta));
-  offset += sizeof(fprintf_delta);
+  int32_t setenv_delta = compute_jmp(mmap_memory, their_setenv);
+  memmove(new_text + offset, &setenv_delta, sizeof(setenv_delta));
+  offset += sizeof(setenv_delta);
 
   // insert a TRAP instruction
   new_text[offset++] = 0xcc;
 
-  // copy our fprintf format string right after the TRAP instruction
-  memmove(new_text + offset, format, strlen(format));
+
+  // copy our setenv key and value string right after the TRAP instruction
+  memmove(new_text + offset, env_key, strlen(env_key));
+  memmove(new_text + offset + strlen(env_key) + 1, env_value, strlen(env_value));
 
   // update the mmap area
   printf("inserting code/data into the mmap area at %p\n", mmap_memory);
@@ -291,12 +289,12 @@ int fprintf_process(pid_t pid) {
     goto fail;
   }
 
-  // set up our registers with the args to fprintf
-  // memmove(&newregs, &oldregs, sizeof(newregs));
-  newregs.rax = 0;                          // no vector registers are used
-  newregs.rdi = (long)their_stderr;         // pointer to stderr in the caller
-  newregs.rsi = (long)mmap_memory + offset; // pointer to the format string
-  newregs.rdx = oldregs.rip;                // the integer we want to print
+  // set up our registers with the args to setenv
+  newregs.rax = 0; // no vector registers are used
+  newregs.rdi = (long)mmap_memory + offset;
+  newregs.rsi = (long)mmap_memory + offset+strlen(env_key)+1;
+  newregs.rdx = (long)mmap_memory + offset;
+
 
   printf("setting the registers of the remote process\n");
   if (ptrace(PTRACE_SETREGS, pid, NULL, &newregs)) {
@@ -394,7 +392,7 @@ int main(int argc, char **argv) {
   while ((c = getopt(argc, argv, "hp:")) != -1) {
     switch (c) {
     case 'h':
-      printf("Usage: %s -p <pid>\n", argv[0]);
+      printf("Usage: %s -p <pid> $key $value\n", argv[0]);
       return 0;
       break;
     case 'p':
@@ -427,5 +425,11 @@ int main(int argc, char **argv) {
     fprintf(stderr, "must specify a remote process with -p\n");
     return 1;
   }
-  return fprintf_process((pid_t)pid);
+  if (argc - optind < 2) {
+    fprintf(stderr, "must specify $key and $value\n");
+    return 1;
+  }
+  printf("OPTIND:%d argc:%d\n", optind, argc);
+
+  return setenv_process((pid_t)pid, argv[optind], argv[optind+1]);
 }
